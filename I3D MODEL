@@ -1,0 +1,390 @@
+# I3D MODEL DEFINITIONS (3 VARIATIONS)
+
+class I3D_Base(nn.Module):
+    """Base class for I3D models"""
+    def extract_features(self, x):
+        with torch.no_grad():
+            feats = self.features(x)
+            feats = self.pool(feats)
+            return feats.view(feats.size(0), -1)
+
+
+class I3D_R3D(I3D_Base):
+    """R3D-18: ResNet3D backbone - Standard 3D CNN"""
+    def __init__(self, num_classes=2, pretrained=True):
+        super().__init__()
+        backbone = r3d_18(pretrained=pretrained)
+        self.features = nn.Sequential(*list(backbone.children())[:-1])
+        self.pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.5), nn.Linear(512, 256), nn.ReLU(),
+            nn.Dropout(0.3), nn.Linear(256, num_classes)
+        )
+    
+    def forward(self, x):
+        feats = self.features(x)
+        feats = self.pool(feats).view(feats.size(0), -1)
+        return self.classifier(feats)
+
+
+class I3D_MC3(I3D_Base):
+    """MC3-18: Mixed Convolution 3D - Efficient 3D CNN"""
+    def __init__(self, num_classes=2, pretrained=True):
+        super().__init__()
+        backbone = mc3_18(pretrained=pretrained)
+        self.features = nn.Sequential(*list(backbone.children())[:-1])
+        self.pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.5), nn.Linear(512, 256), nn.ReLU(),
+            nn.Dropout(0.3), nn.Linear(256, num_classes)
+        )
+    
+    def forward(self, x):
+        feats = self.features(x)
+        feats = self.pool(feats).view(feats.size(0), -1)
+        return self.classifier(feats)
+
+
+class I3D_S3D(I3D_Base):
+    """S3D-G: Separable 3D CNN - Most efficient, good for motion"""
+    def __init__(self, num_classes=2, pretrained=True):
+        super().__init__()
+        backbone = s3d(pretrained=pretrained)
+        self.features = nn.Sequential(*list(backbone.children())[:-1])
+        self.pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.5), nn.Linear(1024, 512), nn.ReLU(),
+            nn.Dropout(0.3), nn.Linear(512, num_classes)
+        )
+    
+    def forward(self, x):
+        feats = self.features(x)
+        feats = self.pool(feats).view(feats.size(0), -1)
+        return self.classifier(feats)
+
+print("I3D models defined: R3D-18, MC3-18, S3D-G")
+
+
+# I3D FEATURE EXTRACTION FUNCTION
+
+def extract_i3d_features(model_type='r3d'):
+    """Extract 512-D features from RIFE clips"""
+    print(f"\n{'='*80}\nI3D FEATURE EXTRACTION: {model_type.upper()}\n{'='*80}")
+    
+    # Load model
+    if model_type == 'r3d':
+        model = I3D_R3D(pretrained=True).to(config.DEVICE)
+    elif model_type == 'mc3':
+        model = I3D_MC3(pretrained=True).to(config.DEVICE)
+    elif model_type == 's3d':
+        model = I3D_S3D(pretrained=True).to(config.DEVICE)
+    else:
+        raise ValueError(f"Unknown model: {model_type}")
+    
+    model.eval()
+    
+    # Transforms
+    tform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((112, 112)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    # Process clips
+    save_dir = config.FEATURE_DIR / model_type
+    save_dir.mkdir(exist_ok=True)
+    
+    rified_folders = sorted([f for f in config.RIFIED_DIR.iterdir() if f.is_dir()])
+    
+    for folder in tqdm(rified_folders, desc=f"{model_type.upper()} features"):
+        frames = sorted(folder.glob("*.jpg"))
+        
+        if len(frames) < config.CLIP_LENGTH:
+            continue
+        
+        clip_features = []
+        
+        # Extract non-overlapping 16-frame clips
+        for i in range(0, len(frames) - config.CLIP_LENGTH + 1, config.CLIP_LENGTH):
+            imgs = []
+            for fp in frames[i:i + config.CLIP_LENGTH]:
+                img = cv2.cvtColor(cv2.imread(str(fp)), cv2.COLOR_BGR2RGB)
+                imgs.append(tform(img))
+            
+            clip = torch.stack(imgs, dim=1).unsqueeze(0).to(config.DEVICE)  # [1, 3, 16, 112, 112]
+            feat = model.extract_features(clip).cpu().numpy().squeeze()  # [512]
+            clip_features.append(feat)
+        
+        if len(clip_features) > 0:
+            arr = np.stack(clip_features, axis=0)  # [num_clips, 512]
+            np.save(save_dir / f"{folder.name}.npy", arr)
+    
+    print(f"{model_type.upper()} features saved: {len(list(save_dir.glob('*.npy')))}")
+
+
+# BI-LSTM CLASSIFIER
+
+class NostrilLSTM(nn.Module):
+    """Bi-LSTM for temporal pain classification"""
+    def __init__(self, input_dim=512, hidden_dim=256, num_layers=2, 
+                 num_classes=2, dropout=0.3, use_attention=True):
+        super().__init__()
+        self.use_attention = use_attention
+        
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, 
+                           batch_first=True, bidirectional=True,
+                           dropout=dropout if num_layers > 1 else 0.0)
+        
+        if use_attention:
+            self.attention = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.Tanh(),
+                nn.Linear(hidden_dim, 1)
+            )
+        
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim * 2, 256), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(256, 128), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(128, num_classes)
+        )
+    
+    def forward(self, x, lengths):
+        B, T, _ = x.shape
+        
+        packed = nn.utils.rnn.pack_padded_sequence(
+            x, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        lstm_out, (h_n, _) = self.lstm(packed)
+        lstm_out, _ = nn.utils.rnn.pad_packed_sequence(
+            lstm_out, batch_first=True, total_length=T
+        )
+        
+        if self.use_attention:
+            scores = self.attention(lstm_out)
+            mask = (torch.arange(T).unsqueeze(0).to(lengths.device) <
+                   lengths.unsqueeze(1)).unsqueeze(2).float()
+            scores = scores.masked_fill(mask == 0, -1e9)
+            attn = torch.softmax(scores, dim=1)
+            context = (lstm_out * attn).sum(dim=1)
+        else:
+            context = torch.cat([h_n[-2], h_n[-1]], dim=1)
+        
+        return self.classifier(context)
+
+# DATASET & TRAINING
+
+class SequenceDataset(Dataset):
+    def __init__(self, video_ids, labels, feature_dir, model_type):
+        self.video_ids = video_ids
+        self.labels = labels
+        self.feat_dir = Path(feature_dir) / model_type
+        
+        self.sequences, self.seq_lengths = [], []
+        
+        for vid, lab in zip(video_ids, labels):
+            fp = self.feat_dir / f"{vid}.npy"
+            if fp.exists():
+                feats = np.load(fp)
+                self.sequences.append(torch.FloatTensor(feats))
+                self.seq_lengths.append(len(feats))
+    
+    def __len__(self):
+        return len(self.sequences)
+    
+    def __getitem__(self, idx):
+        return self.sequences[idx], self.labels[idx], self.seq_lengths[idx]
+
+
+def collate_fn(batch):
+    sequences, labels, lengths = zip(*batch)
+    max_len = max(lengths)
+    
+    padded = []
+    for seq in sequences:
+        if len(seq) < max_len:
+            pad = torch.zeros(max_len - len(seq), seq.size(1))
+            padded.append(torch.cat([seq, pad], dim=0))
+        else:
+            padded.append(seq)
+    
+    return torch.stack(padded), torch.LongTensor(labels), torch.LongTensor(lengths)
+
+
+def train_lstm(train_ds, val_ds, model_type, **kwargs):
+    """Train Bi-LSTM"""
+    print(f"\n{'='*80}\nTRAINING LSTM: {model_type.upper()}\n{'='*80}")
+    
+    train_loader = DataLoader(train_ds, batch_size=config.BATCH_SIZE, 
+                             shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=config.BATCH_SIZE, 
+                           shuffle=False, collate_fn=collate_fn)
+    
+    model = NostrilLSTM(**kwargs).to(config.DEVICE)
+    
+    # Class weights
+    mild = sum(1 for l in train_ds.labels if l == 0)
+    mod = sum(1 for l in train_ds.labels if l == 1)
+    weights = torch.FloatTensor([mod / max(mild, 1), 1.0]).to(config.DEVICE)
+    
+    criterion = nn.CrossEntropyLoss(weight=weights)
+    optimizer = optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=0.01)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', 
+                                                     factor=0.5, patience=5)
+    
+    best_f1 = 0.0
+    patience_cnt = 0
+    save_path = config.RESULTS_DIR / f"lstm_{model_type}_best.pth"
+    
+    for epoch in range(1, config.NUM_EPOCHS + 1):
+        # Train
+        model.train()
+        train_loss = 0.0
+        for x, y, lens in train_loader:
+            x, y, lens = x.to(config.DEVICE), y.to(config.DEVICE), lens.to(config.DEVICE)
+            optimizer.zero_grad()
+            logits = model(x, lens)
+            loss = criterion(logits, y)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+        
+        # Val
+        model.eval()
+        val_loss, preds, trues = 0.0, [], []
+        with torch.no_grad():
+            for x, y, lens in val_loader:
+                x, y, lens = x.to(config.DEVICE), y.to(config.DEVICE), lens.to(config.DEVICE)
+                logits = model(x, lens)
+                val_loss += criterion(logits, y).item()
+                preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
+                trues.extend(y.cpu().numpy())
+        
+        val_f1 = f1_score(trues, preds, average='macro')
+        val_acc = np.mean(np.array(trues) == np.array(preds))
+        
+        print(f"Epoch {epoch:02d}: TrainLoss={train_loss/len(train_loader):.4f}, "
+              f"ValF1={val_f1:.4f}, ValAcc={val_acc:.3f}")
+        
+        scheduler.step(val_f1)
+        
+        if val_f1 > best_f1:
+            best_f1 = val_f1
+            patience_cnt = 0
+            torch.save({'model_state_dict': model.state_dict(), 'best_f1': best_f1}, save_path)
+            print(f"  ✓ Best model saved (F1={best_f1:.4f})")
+        else:
+            patience_cnt += 1
+            if patience_cnt >= 10:
+                print("  Early stopping")
+                break
+    
+    return model, best_f1
+
+
+def evaluate_lstm(model_path, test_ds, model_type, **kwargs):
+    """Test evaluation"""
+    print(f"\n{'='*80}\nTEST EVAL: {model_type.upper()}\n{'='*80}")
+    
+    model = NostrilLSTM(**kwargs).to(config.DEVICE)
+    ckpt = torch.load(model_path, map_location=config.DEVICE)
+    model.load_state_dict(ckpt['model_state_dict'])
+    model.eval()
+    
+    loader = DataLoader(test_ds, batch_size=1, shuffle=False, collate_fn=collate_fn)
+    
+    preds, trues = [], []
+    with torch.no_grad():
+        for i, (x, y, lens) in enumerate(loader):
+            x, y, lens = x.to(config.DEVICE), y.to(config.DEVICE), lens.to(config.DEVICE)
+            logits = model(x, lens)
+            pred = torch.argmax(logits, dim=1).item()
+            preds.append(pred)
+            trues.append(y.item())
+            
+            mark = "✓" if pred == y.item() else "✗"
+            print(f"{test_ds.video_ids[i]:12s} | "
+                  f"True={config.CLASS_NAMES[y.item()]:9s} "
+                  f"Pred={config.CLASS_NAMES[pred]:9s} {mark}")
+    
+    test_f1 = f1_score(trues, preds, average='macro')
+    test_acc = np.mean(np.array(trues) == np.array(preds))
+    
+    print(f"\nTest Accuracy: {test_acc:.4f}, Test F1: {test_f1:.4f}")
+    print("\n" + classification_report(trues, preds, target_names=config.CLASS_NAMES))
+    
+    # Confusion matrix
+    cm = confusion_matrix(trues, preds)
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+               xticklabels=config.CLASS_NAMES, yticklabels=config.CLASS_NAMES)
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title(f'Nostril LSTM ({model_type.upper()})')
+    plt.tight_layout()
+    plt.savefig(config.RESULTS_DIR / f"confmat_{model_type}.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    return test_f1, test_acc
+
+# MAIN EXECUTION: RUN ALL 3 I3D VARIANTS
+
+# Define splits
+test_videos = ['S2_Video', 'S4_Video', 'S7_Video']
+all_videos = list(config.VIDEO_PAIN_LEVELS.keys())
+train_val = [v for v in all_videos if v not in test_videos]
+val_videos = train_val[-2:]
+train_videos = train_val[:-2]
+
+train_labels = [config.VIDEO_PAIN_LEVELS[v] for v in train_videos]
+val_labels = [config.VIDEO_PAIN_LEVELS[v] for v in val_videos]
+test_labels = [config.VIDEO_PAIN_LEVELS[v] for v in test_videos]
+
+print(f"\nSplit: Train={len(train_videos)}, Val={len(val_videos)}, Test={len(test_videos)}")
+
+# Run all 3 models
+results = []
+
+for model_type in ['r3d', 'mc3', 's3d']:
+    print(f"\n\n{'#'*80}\nPROCESSING MODEL: {model_type.upper()}\n{'#'*80}")
+    
+    # Extract features
+    extract_i3d_features(model_type)
+    
+    # Create datasets
+    train_ds = SequenceDataset(train_videos, train_labels, config.FEATURE_DIR, model_type)
+    val_ds = SequenceDataset(val_videos, val_labels, config.FEATURE_DIR, model_type)
+    test_ds = SequenceDataset(test_videos, test_labels, config.FEATURE_DIR, model_type)
+    
+    # Train
+    model, best_val_f1 = train_lstm(
+        train_ds, val_ds, model_type,
+        input_dim=512, hidden_dim=256, num_layers=2,
+        num_classes=2, dropout=0.3, use_attention=True
+    )
+    
+    # Test
+    test_f1, test_acc = evaluate_lstm(
+        config.RESULTS_DIR / f"lstm_{model_type}_best.pth",
+        test_ds, model_type,
+        input_dim=512, hidden_dim=256, num_layers=2,
+        num_classes=2, dropout=0.3, use_attention=True
+    )
+    
+    results.append({
+        'model': model_type,
+        'val_f1': float(best_val_f1),
+        'test_f1': float(test_f1),
+        'test_acc': float(test_acc)
+    })
+
+# FINAL RESULTS
+print("FINAL RESULTS SUMMARY")
+
+df = pd.DataFrame(results)
+print(df.to_string(index=False))
+
+csv_path = config.RESULTS_DIR / "nostril_i3d_comparison.csv"
+df.to_csv(csv_path, index=False)
+print(f"\n Results saved: {csv_path}")
+print("\n PIPELINE COMPLETE")
