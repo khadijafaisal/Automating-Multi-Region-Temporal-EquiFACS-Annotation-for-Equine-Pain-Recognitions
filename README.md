@@ -22,9 +22,7 @@ for automated nostril-based pain detection.
 5. I3D classification
 
 ## Results
-- Accuracy: 87.4%
-- F1-score: 0.87
-- AUC: 0.90
+- Accuracy: 79.5%
+- F1-score: 0.77
+- AUC: 0.70
 
-## Citation
-IEEE-format citations provided in final report.
