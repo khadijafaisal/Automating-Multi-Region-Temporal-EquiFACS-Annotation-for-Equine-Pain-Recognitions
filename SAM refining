@@ -1,0 +1,72 @@
+from segment_anything import sam_model_registry, SamPredictor
+
+SAM_WEIGHTS = "/kaggle/input/sam2-file/sam2_l.pth"  
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+sam = sam_model_registry["vit_l"](checkpoint=SAM_WEIGHTS)
+sam.to(device)   
+predictor = SamPredictor(sam)
+
+print("Loaded SAM model on:", device)
+
+CROP_DIR = Path("/kaggle/working/nostril_balanced/crops")
+MASK_DIR = Path("/kaggle/working/nostril_balanced/masks")
+CROP_DIR.mkdir(parents=True, exist_ok=True)
+MASK_DIR.mkdir(parents=True, exist_ok=True)
+
+preds = json.load(open(OUTPUT_PRED))
+
+# GPU-enabled crop function
+def crop_sam(img_bgr, box):
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+    # SAM predictor stores embeddings internally
+    predictor.set_image(img_rgb)
+
+    masks, scores, logits = predictor.predict(
+        box=np.array(box),
+        multimask_output=False
+    )
+
+    mask = masks[0].astype(np.uint8)
+    ys, xs = np.where(mask == 1)
+
+    if len(xs)==0 or len(ys)==0:
+        return None
+
+    y1, y2 = ys.min(), ys.max()
+    x1, x2 = xs.min(), xs.max()
+
+    crop = img_bgr[y1:y2, x1:x2]
+    crop = cv2.resize(crop, (224, 224))
+    return crop, mask
+
+# Main loop
+saved = 0
+
+for img_name, v in tqdm(preds.items(), desc="SAM refine"):
+    split = v["split"]
+    img_path = DATASET_IMG / split / img_name
+    box = v["bbox"]
+
+    img = cv2.imread(str(img_path))
+
+    out = crop_sam(img, box)
+
+    if out is None:
+        # fallback to YOLO crop
+        x1, y1, x2, y2 = map(int, box)
+        crop = img[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+        crop = cv2.resize(crop, (224,224))
+        cv2.imwrite(str(CROP_DIR/img_name), crop)
+        saved += 1
+        continue
+
+    crop, mask = out
+    cv2.imwrite(str(CROP_DIR/img_name), crop)
+    cv2.imwrite(str(MASK_DIR/(img_name.replace(".jpg",".png"))), mask * 255)
+    saved += 1
+/
+print("Saved refined crops:", saved)
