@@ -1,0 +1,119 @@
+from pathlib import Path
+from tqdm import tqdm
+
+FRAMES_ROOT = Path("/kaggle/working/nostril_balanced/frames")
+CROP_DIR = Path("/kaggle/working/nostril_balanced/crops")
+CLIP_DIR = Path("/kaggle/working/nostril_balanced/clips")
+CLIP_DIR.mkdir(exist_ok=True)
+
+WINDOW = 16
+
+def get_index(name):
+    num = name.split("_")[-1].split(".")[0]
+    return int(num)
+
+frame_map = {}
+
+for video_folder in FRAMES_ROOT.iterdir():
+    if video_folder.is_dir():
+        for f in video_folder.glob("frame_*.jpg"):
+            idx = int(f.stem.replace("frame_", ""))
+            frame_map[idx] = str(f)
+
+print("Total indexed frames:", len(frame_map))
+
+
+# Now create clips
+saved = 0
+
+for crop_file in tqdm(list(CROP_DIR.glob("*.jpg")), desc="Make clips"):
+    idx = get_index(crop_file.name)
+
+    frames = []
+
+    start = max(0, idx - WINDOW//2)
+    end = start + WINDOW
+
+    for i in range(start, end):
+        if i in frame_map:
+            frames.append(frame_map[i])
+
+    # If no frames found → skip
+    if len(frames) == 0:
+        continue
+
+    # Pad to full window
+    while len(frames) < WINDOW:
+        frames.append(frames[-1])
+
+    out_file = CLIP_DIR / f"{crop_file.stem}.txt"
+    out_file.write_text("\n".join(frames))
+
+    saved += 1
+
+print("Clips created:", saved)
+
+!pip install scikit-video
+!pip install imageio-ffmpeg
+
+!git clone https://github.com/megvii-research/ECCV2022-RIFE /kaggle/working/rife
+!pip install torchvision tqdm
+
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+from pathlib import Path
+import shutil
+from tqdm import tqdm
+
+RIFE = Path("/kaggle/working/rife")
+CLIP_DIR = Path("/kaggle/working/nostril_balanced/clips")
+RIFIED = Path("/kaggle/working/nostril_balanced/rified")
+RIFIED.mkdir(exist_ok=True)
+
+def build_concat_video(frames, temp_dir):
+    concat_file = temp_dir/"c.txt"
+    with open(concat_file, "w") as f:
+        for fr in frames:
+            f.write(f"file '{fr}'\n")
+
+    raw_video = temp_dir/"raw.mp4"
+    !ffmpeg -f concat -safe 0 -i {concat_file} -framerate 10 \
+            -c:v libx264 -pix_fmt yuv420p {raw_video} -y
+    return raw_video
+
+
+def run_rife_gpu(input_video, output_video):
+    """
+    Runs RIFE with GPU if available.
+    """
+    cmd = f"python {RIFE}/inference_video.py --video {input_video} --output {output_video} --exp=1"
+    print("Running:", cmd)
+    os.system(cmd)
+
+
+def extract_frames(video_path, out_dir):
+    out_dir.mkdir(exist_ok=True)
+    !ffmpeg -i {video_path} {out_dir}/%06d.jpg -y
+
+
+for txt in tqdm(CLIP_DIR.glob("*.txt"), desc="Upsampling to 50fps"):
+    frames = txt.read_text().splitlines()
+
+    # recreate temp directory
+    temp = Path("/kaggle/working/tmp")
+    if temp.exists():
+        shutil.rmtree(temp)
+    temp.mkdir()
+
+    raw_video = build_concat_video(frames, temp)
+
+    # output of RIFE
+    up_video = temp/"rife_50fps.mp4"
+    run_rife_gpu(raw_video, up_video)
+
+    # extract back to frames
+    out_dir = RIFIED / txt.stem
+    extract_frames(up_video, out_dir)
+
+print(" RIFE upsample complete:", len(list(RIFIED.iterdir())))
