@@ -1,0 +1,247 @@
+# FRAME EXTRACTION WITH QUALITY CHECK
+def extract_frames_smart(video_path, output_dir, sample_rate=4):
+    """
+    Extract frames with quality checks:
+    - Skip blurry frames (Laplacian variance)
+    - Sample every Nth frame to reduce redundancy
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    cap = cv2.VideoCapture(video_path)
+    
+    frame_num = 0
+    saved_count = 0
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Sample every Nth frame
+        if frame_num % sample_rate != 0:
+            frame_num += 1
+            continue
+        
+        # Quality check: blur detection
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        
+        if laplacian_var < 50:  # Too blurry
+            frame_num += 1
+            continue
+        
+        # Save frame
+        frame_filename = f"frame_{frame_num:06d}.jpg"
+        cv2.imwrite(os.path.join(output_dir, frame_filename), frame)
+        saved_count += 1
+        frame_num += 1
+    
+    cap.release()
+    return saved_count
+
+print("EXTRACTING FRAMES WITH QUALITY FILTERING")
+
+frames_root = os.path.join(config.OUTPUT_ROOT, "frames")
+os.makedirs(frames_root, exist_ok=True)
+
+for video_name in tqdm(os.listdir(config.VIDEOS_PATH), desc="Videos"):
+    if not video_name.lower().endswith((".mp4", ".avi", ".mov")):
+        continue
+    
+    video_path = os.path.join(config.VIDEOS_PATH, video_name)
+    video_id = os.path.splitext(video_name)[0]
+    save_dir = os.path.join(frames_root, video_id)
+    
+    count = extract_frames_smart(video_path, save_dir, sample_rate=4)
+    print(f"  {video_id}: {count} frames extracted")
+
+
+# INTELLIGENT LABEL MATCHING + QUALITY AUDIT
+def validate_bbox(bbox, img_width, img_height):
+    """
+    Validate YOLO format bounding box:
+    - Check if within image bounds
+    - Check minimum/maximum size
+    - Return filtered bbox or None
+    """
+    cls, x_center, y_center, width, height = bbox
+    
+    # Convert to pixel coordinates
+    x_center_px = x_center * img_width
+    y_center_px = y_center * img_height
+    w_px = width * img_width
+    h_px = height * img_height
+    
+    # Size validation
+    if w_px < config.MIN_NOSTRIL_SIZE or h_px < config.MIN_NOSTRIL_SIZE:
+        return None  # Too small
+    if w_px > config.MAX_NOSTRIL_SIZE or h_px > config.MAX_NOSTRIL_SIZE:
+        return None  # Too large (likely wrong annotation)
+    
+    # Bounds check
+    if x_center < 0 or x_center > 1 or y_center < 0 or y_center > 1:
+        return None
+    
+    return bbox
+
+print("\n MATCHING LABELS TO FRAMES + QUALITY AUDIT")
+
+# Build frame index
+frame_index = {}
+for video_folder in os.listdir(frames_root):
+    video_path = os.path.join(frames_root, video_folder)
+    if not os.path.isdir(video_path):
+        continue
+    
+    for file in os.listdir(video_path):
+        if file.endswith(".jpg"):
+            try:
+                frame_num = int(file.replace("frame_", "").replace(".jpg", ""))
+                frame_index[(video_folder, frame_num)] = os.path.join(video_path, file)
+            except:
+                continue
+
+print(f"Total frames indexed: {len(frame_index)}")
+
+# Match labels and validate
+matched_data = []
+label_issues = {"too_small": 0, "too_large": 0, "out_of_bounds": 0}
+
+for video_folder in tqdm(os.listdir(config.NOSTRIL_LABELS), desc="Processing labels"):
+    label_dir = os.path.join(config.NOSTRIL_LABELS, video_folder, "labels")
+    if not os.path.isdir(label_dir):
+        continue
+    
+    for lbl_file in os.listdir(label_dir):
+        if not lbl_file.endswith(".txt"):
+            continue
+        
+        # Extract frame number
+        try:
+            frame_num = int(lbl_file.replace("frame_", "").replace(".txt", ""))
+        except:
+            continue
+        
+        # Check if frame exists
+        if (video_folder, frame_num) not in frame_index:
+            continue
+        
+        frame_path = frame_index[(video_folder, frame_num)]
+        label_path = os.path.join(label_dir, lbl_file)
+        
+        # Load image to get dimensions
+        img = cv2.imread(frame_path)
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+        
+        # Validate bounding boxes
+        with open(label_path, 'r') as f:
+            lines = f.readlines()
+        
+        valid_boxes = []
+        for line in lines:
+            parts = line.strip().split()
+            if len(parts) != 5:
+                continue
+            
+            bbox = [int(parts[0])] + [float(x) for x in parts[1:]]
+            validated = validate_bbox(bbox, w, h)
+            
+            if validated is None:
+                # Track issues
+                x_c, y_c, bw, bh = [float(x) for x in parts[1:]]
+                w_px, h_px = bw * w, bh * h
+                if w_px < config.MIN_NOSTRIL_SIZE or h_px < config.MIN_NOSTRIL_SIZE:
+                    label_issues["too_small"] += 1
+                elif w_px > config.MAX_NOSTRIL_SIZE or h_px > config.MAX_NOSTRIL_SIZE:
+                    label_issues["too_large"] += 1
+                else:
+                    label_issues["out_of_bounds"] += 1
+            else:
+                valid_boxes.append(validated)
+        
+        # Store only if valid boxes exist
+        if len(valid_boxes) > 0:
+            matched_data.append({
+                'frame_path': frame_path,
+                'label_path': label_path,
+                'num_nostrils': len(valid_boxes),
+                'video': video_folder,
+                'frame_num': frame_num,
+                'valid_boxes': valid_boxes
+            })
+
+print(f"\nValid matched pairs: {len(matched_data)}")
+print(f"Filtered labels:")
+print(f"  - Too small: {label_issues['too_small']}")
+print(f"  - Too large: {label_issues['too_large']}")
+print(f"  - Out of bounds: {label_issues['out_of_bounds']}")
+
+
+# BACKGROUND FRAME SAMPLING (CRITICAL FOR PRECISION)
+
+print("\nSAMPLING BACKGROUND FRAMES (NO NOSTRILS)")
+
+
+# Find frames without labels 
+labeled_frames = set((d['video'], d['frame_num']) for d in matched_data)
+all_frames = set(frame_index.keys())
+background_frames = all_frames - labeled_frames
+
+print(f"Available background frames: {len(background_frames)}")
+
+# Sample background frames
+target_bg_count = int(len(matched_data) * config.BACKGROUND_RATIO)
+sampled_bg = random.sample(list(background_frames), min(target_bg_count, len(background_frames)))
+
+background_data = []
+for video, frame_num in sampled_bg:
+    background_data.append({
+        'frame_path': frame_index[(video, frame_num)],
+        'label_path': None,  # No label file needed
+        'num_nostrils': 0,
+        'video': video,
+        'frame_num': frame_num,
+        'valid_boxes': []
+    })
+
+print(f" Sampled {len(background_data)} background frames")
+
+# Combine datasets
+all_data = matched_data + background_data
+random.shuffle(all_data)
+
+print(f"\nFinal dataset composition:")
+print(f"  - Nostril frames: {len(matched_data)} ({len(matched_data)/len(all_data)*100:.1f}%)")
+print(f"  - Background frames: {len(background_data)} ({len(background_data)/len(all_data)*100:.1f}%)")
+
+# TRAIN/VAL SPLIT (STRATIFIED BY VIDEO)
+print("CREATING BALANCED TRAIN/VAL SPLIT")
+
+# Group by video to avoid data leakage
+video_groups = {}
+for item in all_data:
+    video = item['video']
+    if video not in video_groups:
+        video_groups[video] = []
+    video_groups[video].append(item)
+
+# Split videos
+videos = list(video_groups.keys())
+train_videos, val_videos = train_test_split(
+    videos, 
+    test_size=config.VAL_RATIO, 
+    random_state=config.RANDOM_SEED
+)
+
+train_data = []
+val_data = []
+
+for video in train_videos:
+    train_data.extend(video_groups[video])
+
+for video in val_videos:
+    val_data.extend(video_groups[video])
+
+print(f"Train videos: {len(train_videos)} → {len(train_data)} frames")
+print(f"Val videos: {len(val_videos)} → {len(val_data)} frames")
